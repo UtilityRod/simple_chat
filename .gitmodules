@@ -1,3 +1,6 @@
 [submodule "deps/event_loop"]
 	path = deps/event_loop
 	url = git@github.com:UtilityRod/event_loop.git
+[submodule "deps/networking"]
+	path = deps/networking
+	url = git@github.com:UtilityRod/networking.git
