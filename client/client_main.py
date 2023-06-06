@@ -11,8 +11,10 @@ def main():
         sock.connect((HOST, PORT))
         msg = b"Hello from client"
         msg_len = len(msg)
-        buff_fmt = f"!I{msg_len}s"
-        buff = struct.pack(buff_fmt, msg_len, msg)
+        username = b"UtilityRod"
+        username_len = len(username)
+        buff_fmt = f"!III{username_len}s{msg_len}s"
+        buff = struct.pack(buff_fmt, 1, username_len, msg_len, username, msg)
         sock.sendall(buff)
         
 
