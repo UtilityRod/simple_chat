@@ -5,33 +5,37 @@
 
 typedef enum {
     CONNECT,
-    MESSAGE,
+    JOIN,
     NUMBER_OF_TYPES,
 } packet_type_t;
 
 typedef struct {
-    int * clients;
     tcp_server_t * tcp_server;
     eloop_t * eloop;
+    circular_list_t * clients;
 } chat_server_t;
 
 typedef struct {
-    eloop_t * eloop;
-    int * client_fd;
-} connection_data_t;
+    chat_server_t * server;
+    int client_fd;
+} server_data_t;
 
 static chat_server_t * chat_server_init(size_t allowed_clients, const char * port);
 static void chat_server_destroy(chat_server_t * server);
+
 static int connection_event(void * data);
 static int connection_destroy(void * data);
-static int message_event(void * data);
-static int message_destroy(void * data);
+
+static int join_event(void * data);
+static int join_destroy(void * data);
+
 static event_t * generate_event(packet_type_t type, void * data);
+static void username_destroy(void * data);
 
 int main(void)
 {
     int rv = 0;
-    connection_data_t * connection_data = NULL;
+    server_data_t * server_data = NULL;
     event_t * event = NULL;
     chat_server_t * server = chat_server_init(10, "44567");
 
@@ -51,42 +55,29 @@ int main(void)
             continue;
         }
 
-        connection_data = calloc(1, sizeof(*connection_data));
+        server_data = calloc(1, sizeof(*server_data));
 
-        if (!connection_data)
+        if (!server_data)
         {
-            close(client_fd);
-            continue;
-        }
-
-        connection_data->client_fd = calloc(1, sizeof(*(connection_data->client_fd)));
-
-        if (!(connection_data->client_fd))
-        {
-            free(connection_data);
             close(client_fd);
             continue;
         }
         
-        *(connection_data->client_fd) = client_fd;
-        connection_data->eloop = server->eloop;
-        event = generate_event(CONNECT, connection_data);
+        server_data->client_fd = client_fd;
+        server_data->server = server;
+        event = generate_event(CONNECT, server_data);
 
         if (!event)
         {
-            *(connection_data->client_fd) = -1;
-            connection_data->eloop = NULL;
-            free(connection_data->client_fd);
-            free(connection_data);
             close(client_fd);
             continue;
         }
 
         eloop_add(server->eloop, event);
-        connection_data = NULL;
+        server_data = NULL;
         event = NULL;
 
-        sleep(10);
+        sleep(5);
         break;
     }
 
@@ -110,7 +101,7 @@ static chat_server_t * chat_server_init(size_t allowed_clients, const char * por
         goto init_return;
     }
 
-    server->clients = calloc(allowed_clients, sizeof(*(server->clients)));
+    server->clients = circular_create(client_compare, client_destroy);
 
     if (!(server->clients))
     {
@@ -147,9 +138,12 @@ static void chat_server_destroy(chat_server_t * server)
         goto destroy_return;
     }
 
+    circular_destroy(server->clients);
+    server->clients = NULL;
     tcp_server_teardown(server->tcp_server);
+    server->tcp_server = NULL;
     eloop_destroy(server->eloop);
-    free(server->clients);
+    server->eloop = NULL;
     free(server);
 
 destroy_return:
@@ -158,40 +152,36 @@ destroy_return:
 
 static int connection_event(void * data)
 {
-    int rv = 0;
-    connection_data_t * event_data = (connection_data_t *)data;
-    int * client_fd = event_data->client_fd;
+    int rv = -1;
+    server_data_t * server_data = (server_data_t *)data;
+    eloop_t * eloop = server_data->server->eloop;
     uint32_t packet_type = 0;
-    size_t nread = tcp_read_all(*client_fd, &packet_type, sizeof(packet_type));
+    size_t nread = tcp_read_all(server_data->client_fd, &packet_type, sizeof(packet_type));
 
     if (nread != sizeof(packet_type))
     {
-        rv = -1;
         goto cleanup;
     }
 
     packet_type = ntohl(packet_type);
 
-    if (packet_type >= NUMBER_OF_TYPES)
+    if (packet_type < NUMBER_OF_TYPES)
     {
-        rv = -1;
-        goto cleanup;
-    }
-    else
-    {
-        event_t * event = generate_event(packet_type, client_fd);
+        event_t * event = generate_event(packet_type, server_data);
 
         if (!event)
         {
             goto cleanup;
         }
-        eloop_add(event_data->eloop, event);
+
+        eloop_add(eloop, event);
+        rv = 0;
         goto event_return;
     }
 
 cleanup:
-    close(*client_fd);
-    *client_fd = -1;
+    close(server_data->client_fd);
+    server_data->client_fd = -1;
 event_return:
     return rv;
 }
@@ -199,99 +189,78 @@ event_return:
 static int connection_destroy(void * data)
 {
     event_t * event = (event_t *)data;
-    connection_data_t * event_data = (connection_data_t *)event->data;
+    server_data_t * server_data = (server_data_t *)event->data;
 
-    if (*(event_data->client_fd) == -1)
+    if (server_data->client_fd == -1)
     {
-        free(event_data->client_fd);
+        server_data->server = NULL;
+        free(server_data);
     }
-
-    event_data->client_fd = NULL;
-    event_data->eloop = NULL;
-    free(event_data);
+    
     event->data = NULL;
     free(event);
     return 0;
 }
 
-static int message_event(void * data)
+static int join_event(void * data)
 {
-    int rv = 0;
-    int * client_fd = (int *)data;
+    int rv = -1;
+    server_data_t * server_data = (server_data_t *)data;
+    int client_fd = server_data->client_fd;
+    circular_list_t * clients = server_data->server->clients;
     uint32_t username_sz = 0;
-    uint32_t message_sz = 0;
-    int nread = tcp_read_all(*client_fd, &username_sz, sizeof(username_sz));
-    
+
+    int nread = tcp_read_all(client_fd, &username_sz, sizeof(username_sz));
+
     if (nread != sizeof(username_sz))
     {
-        fputs("error: username size\n", stderr);
-        rv = -1;
-        goto message_event_return;
-    }
-
-    nread = tcp_read_all(*client_fd, &message_sz, sizeof(message_sz));
-
-    if (nread != sizeof(message_sz))
-    {
-        fputs("error: message size\n", stderr);
-        rv = -1;
-        goto message_event_return;
+        goto client_close;
     }
 
     username_sz = ntohl(username_sz);
-    message_sz = ntohl(message_sz);
 
-    if (username_sz > MAX_USERNAME_SZ || message_sz > MAX_MSG_SZ)
+    if (username_sz > MAX_USERNAME_SZ)
     {
-        fputs("error: username/message max size\n", stderr);
-        rv = -1;
-        goto message_event_return;
+        goto client_close;
     }
 
-    size_t buffer_sz = username_sz + message_sz + 2;
-    char * buffer = calloc(buffer_sz, sizeof(*buffer));
+    char buffer[MAX_USERNAME_SZ + 1];
+    memset(buffer, 0, MAX_USERNAME_SZ + 1);
 
-    if (!buffer)
-    {
-        fputs("error: buffer allocation\n", stderr);
-        rv = -1;
-        goto message_event_return;
-    }
-
-    nread = tcp_read_all(*client_fd, buffer, username_sz);
+    nread = tcp_read_all(client_fd, buffer, username_sz);
 
     if (nread != username_sz)
     {
-        fputs("error: username read\n", stderr);
-        rv = -1;
-        goto cleanup;
+        goto client_close;
     }
 
-    char * buffer_ptr = buffer + username_sz + 1;
-    nread = tcp_read_all(*client_fd, buffer_ptr, message_sz);
+    client_t * client = client_create(buffer);
 
-    if (nread != message_sz)
+    if (!client)
     {
-        fputs("error: message read\n", stderr);
-        rv = -1;
-        goto cleanup;
+        goto client_close;
     }
 
-    printf("%s: %s\n", buffer, (buffer + username_sz + 1));
-
-cleanup:
-    free(buffer);
-    buffer = NULL;
-message_event_return:
+    circular_insert(clients, client, FRONT);
+    printf("%s has joined the chat\n", client->username);
+    rv = 0;
+    goto join_return;
+    
+client_close:
+    close(client_fd);
+join_return:
     return rv;
 }
 
-static int message_destroy(void * data)
+static int join_destroy(void * data)
 {
     event_t * event = (event_t *)data;
-    int * client_fd = event->data;
-    close(*client_fd);
-    free(client_fd);
+
+    server_data_t * server_data = (server_data_t *)event->data;
+    server_data->client_fd = -1;
+    server_data->server = NULL;
+    free(server_data);
+
     event->data = NULL;
     event->dfunc = NULL;
     event->efunc = NULL;
@@ -323,9 +292,9 @@ static event_t * generate_event(packet_type_t type, void * data)
             event->efunc = connection_event;
             event->dfunc = connection_destroy;
             break;
-        case MESSAGE:
-            event->efunc = message_event;
-            event->dfunc = message_destroy;
+        case JOIN:
+            event->efunc = join_event;
+            event->dfunc = join_destroy;
             break;
         default:
             free(event);
